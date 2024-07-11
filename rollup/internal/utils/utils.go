@@ -1,6 +1,7 @@
 package utils
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
@@ -91,7 +92,12 @@ func CalculateChunkMetrics(chunk *encoding.Chunk, codecVersion encoding.CodecVer
 		metrics.L1CommitUncompressedBatchBytesSize, metrics.L1CommitBlobSize, err = codecv2.EstimateChunkL1CommitBatchSizeAndBlobSize(chunk)
 		metrics.EstimateBlobSizeTime = time.Since(start)
 		if err != nil {
-			return nil, fmt.Errorf("failed to estimate codecv2 chunk L1 commit blob size: %w", err)
+			var compressErr *encoding.CompressedDataCompatibilityError
+			if errors.As(err, &compressErr) {
+				return nil, err
+			} else {
+				return nil, fmt.Errorf("failed to estimate codecv2 chunk L1 commit batch size and blob size: %w", err)
+			}
 		}
 		return metrics, nil
 	default:
@@ -171,7 +177,12 @@ func CalculateBatchMetrics(batch *encoding.Batch, codecVersion encoding.CodecVer
 		metrics.L1CommitUncompressedBatchBytesSize, metrics.L1CommitBlobSize, err = codecv2.EstimateBatchL1CommitBatchSizeAndBlobSize(batch)
 		metrics.EstimateBlobSizeTime = time.Since(start)
 		if err != nil {
-			return nil, fmt.Errorf("failed to estimate codecv2 batch L1 commit blob size: %w", err)
+			var compressErr *encoding.CompressedDataCompatibilityError
+			if errors.As(err, &compressErr) {
+				return nil, err
+			} else {
+				return nil, fmt.Errorf("failed to estimate codecv2 batch L1 commit batch size and blob size: %w", err)
+			}
 		}
 		return metrics, nil
 	default:
