@@ -2,18 +2,22 @@ package relayer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"math/big"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/scroll-tech/go-ethereum/accounts/abi"
+	"github.com/scroll-tech/go-ethereum/common"
 	"github.com/scroll-tech/go-ethereum/crypto"
 	"github.com/scroll-tech/go-ethereum/log"
 	"github.com/scroll-tech/go-ethereum/params"
 	"gorm.io/gorm"
 
 	"scroll-tech/common/types"
+	"scroll-tech/common/utils"
 
 	bridgeAbi "scroll-tech/rollup/abi"
 	"scroll-tech/rollup/internal/config"
@@ -42,6 +46,7 @@ type Layer1Relayer struct {
 
 	l1BlockOrm *orm.L1Block
 	l2BlockOrm *orm.L2Block
+	batchOrm   *orm.Batch
 
 	metrics *l1RelayerMetrics
 }
@@ -49,19 +54,23 @@ type Layer1Relayer struct {
 // NewLayer1Relayer will return a new instance of Layer1RelayerClient
 func NewLayer1Relayer(ctx context.Context, db *gorm.DB, cfg *config.RelayerConfig, chainCfg *params.ChainConfig, serviceType ServiceType, reg prometheus.Registerer) (*Layer1Relayer, error) {
 	var gasOracleSender *sender.Sender
-	var err error
 
 	switch serviceType {
 	case ServiceTypeL1GasOracle:
-		gasOracleSender, err = sender.NewSender(ctx, cfg.SenderConfig, cfg.GasOracleSenderPrivateKey, "l1_relayer", "gas_oracle_sender", types.SenderTypeL1GasOracle, db, reg)
+		pKey, err := crypto.ToECDSA(common.FromHex(cfg.GasOracleSenderPrivateKey))
 		if err != nil {
-			addr := crypto.PubkeyToAddress(cfg.GasOracleSenderPrivateKey.PublicKey)
+			return nil, fmt.Errorf("new gas oracle sender failed, err: %v", err)
+		}
+
+		gasOracleSender, err = sender.NewSender(ctx, cfg.SenderConfig, pKey, "l1_relayer", "gas_oracle_sender", types.SenderTypeL1GasOracle, db, reg)
+		if err != nil {
+			addr := crypto.PubkeyToAddress(pKey.PublicKey)
 			return nil, fmt.Errorf("new gas oracle sender failed for address %s, err: %v", addr.Hex(), err)
 		}
 
 		// Ensure test features aren't enabled on the scroll mainnet.
 		if gasOracleSender.GetChainID().Cmp(big.NewInt(534352)) == 0 && cfg.EnableTestEnvBypassFeatures {
-			return nil, fmt.Errorf("cannot enable test env features in mainnet")
+			return nil, errors.New("cannot enable test env features in mainnet")
 		}
 	default:
 		return nil, fmt.Errorf("invalid service type for l1_relayer: %v", serviceType)
@@ -83,6 +92,7 @@ func NewLayer1Relayer(ctx context.Context, db *gorm.DB, cfg *config.RelayerConfi
 		ctx:        ctx,
 		l1BlockOrm: orm.NewL1Block(db),
 		l2BlockOrm: orm.NewL2Block(db),
+		batchOrm:   orm.NewBatch(db),
 
 		gasOracleSender: gasOracleSender,
 		l1GasOracleABI:  bridgeAbi.L1GasPriceOracleABI,
@@ -149,6 +159,19 @@ func (r *Layer1Relayer) ProcessGasPriceOracle() {
 		}
 
 		if r.shouldUpdateGasOracle(baseFee, blobBaseFee, isCurie) {
+			// It indicates the committing batch has been stuck for a long time, it's likely that the L1 gas fee spiked.
+			// If we are not committing batches due to high fees then we shouldn't update fees to prevent users from paying high l1_data_fee
+			// Also, set fees to some default value, because we have already updated fees to some high values, probably
+			var reachTimeout bool
+			if reachTimeout, err = r.commitBatchReachTimeout(); reachTimeout && err == nil {
+				if r.lastBaseFee == r.cfg.GasOracleConfig.L1BaseFeeDefault && r.lastBlobBaseFee == r.cfg.GasOracleConfig.L1BlobBaseFeeDefault {
+					return
+				}
+				baseFee = r.cfg.GasOracleConfig.L1BaseFeeDefault
+				blobBaseFee = r.cfg.GasOracleConfig.L1BlobBaseFeeDefault
+			} else if err != nil {
+				return
+			}
 			var data []byte
 			if isCurie {
 				data, err = r.l1GasOracleABI.Pack("setL1BaseFeeAndBlobBaseFee", new(big.Int).SetUint64(baseFee), new(big.Int).SetUint64(blobBaseFee))
@@ -258,4 +281,20 @@ func (r *Layer1Relayer) shouldUpdateGasOracle(baseFee uint64, blobBaseFee uint64
 	}
 
 	return false
+}
+
+func (r *Layer1Relayer) commitBatchReachTimeout() (bool, error) {
+	fields := map[string]interface{}{
+		"rollup_status IN ?": []types.RollupStatus{types.RollupCommitted, types.RollupFinalizing, types.RollupFinalized},
+	}
+	orderByList := []string{"index DESC"}
+	limit := 1
+	batches, err := r.batchOrm.GetBatches(r.ctx, fields, orderByList, limit)
+	if err != nil {
+		log.Warn("failed to fetch latest committed, finalizing or finalized batch", "err", err)
+		return false, err
+	}
+	// len(batches) == 0 probably shouldn't ever happen, but need to check this
+	// Also, we should check if it's a genesis batch. If so, skip the timeout check.
+	return len(batches) == 0 || (batches[0].Index != 0 && utils.NowUTC().Sub(*batches[0].CommittedAt) > time.Duration(r.cfg.GasOracleConfig.CheckCommittedBatchesWindowMinutes)*time.Minute), nil
 }

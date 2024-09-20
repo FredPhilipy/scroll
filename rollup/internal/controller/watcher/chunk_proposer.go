@@ -2,7 +2,6 @@ package watcher
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"time"
 
@@ -36,7 +35,6 @@ type ChunkProposer struct {
 	chunkTimeoutSec                 uint64
 	gasCostIncreaseMultiplier       float64
 	maxUncompressedBatchBytesSize   uint64
-	forkHeights                     []uint64
 
 	chainCfg *params.ChainConfig
 
@@ -58,20 +56,23 @@ type ChunkProposer struct {
 
 	// total number of times that chunk proposer stops early due to compressed data compatibility breach
 	compressedDataCompatibilityBreachTotal prometheus.Counter
+
+	chunkProposeBlockHeight prometheus.Gauge
+	chunkProposeThroughput  prometheus.Counter
 }
 
 // NewChunkProposer creates a new ChunkProposer instance.
 func NewChunkProposer(ctx context.Context, cfg *config.ChunkProposerConfig, chainCfg *params.ChainConfig, db *gorm.DB, reg prometheus.Registerer) *ChunkProposer {
-	forkHeights, _, _ := forks.CollectSortedForkHeights(chainCfg)
-	log.Debug("new chunk proposer",
+	log.Info("new chunk proposer",
+		"maxBlockNumPerChunk", cfg.MaxBlockNumPerChunk,
 		"maxTxNumPerChunk", cfg.MaxTxNumPerChunk,
 		"maxL1CommitGasPerChunk", cfg.MaxL1CommitGasPerChunk,
 		"maxL1CommitCalldataSizePerChunk", cfg.MaxL1CommitCalldataSizePerChunk,
 		"maxRowConsumptionPerChunk", cfg.MaxRowConsumptionPerChunk,
 		"chunkTimeoutSec", cfg.ChunkTimeoutSec,
 		"gasCostIncreaseMultiplier", cfg.GasCostIncreaseMultiplier,
-		"maxUncompressedBatchBytesSize", cfg.MaxUncompressedBatchBytesSize,
-		"forkHeights", forkHeights)
+		"maxBlobSize", maxBlobSize,
+		"maxUncompressedBatchBytesSize", cfg.MaxUncompressedBatchBytesSize)
 
 	p := &ChunkProposer{
 		ctx:                             ctx,
@@ -86,7 +87,6 @@ func NewChunkProposer(ctx context.Context, cfg *config.ChunkProposerConfig, chai
 		chunkTimeoutSec:                 cfg.ChunkTimeoutSec,
 		gasCostIncreaseMultiplier:       cfg.GasCostIncreaseMultiplier,
 		maxUncompressedBatchBytesSize:   cfg.MaxUncompressedBatchBytesSize,
-		forkHeights:                     forkHeights,
 		chainCfg:                        chainCfg,
 
 		chunkProposerCircleTotal: promauto.With(reg).NewCounter(prometheus.CounterOpts{
@@ -153,6 +153,14 @@ func NewChunkProposer(ctx context.Context, cfg *config.ChunkProposerConfig, chai
 			Name: "rollup_propose_chunk_estimate_blob_size_time",
 			Help: "Time taken to estimate blob size for the chunk.",
 		}),
+		chunkProposeBlockHeight: promauto.With(reg).NewGauge(prometheus.GaugeOpts{
+			Name: "rollup_chunk_propose_block_height",
+			Help: "The block height of the latest proposed chunk",
+		}),
+		chunkProposeThroughput: promauto.With(reg).NewCounter(prometheus.CounterOpts{
+			Name: "rollup_chunk_propose_throughput",
+			Help: "The total gas used in proposed chunks",
+		}),
 	}
 
 	return p
@@ -168,16 +176,65 @@ func (p *ChunkProposer) TryProposeChunk() {
 	}
 }
 
-func (p *ChunkProposer) updateDBChunkInfo(chunk *encoding.Chunk, codecVersion encoding.CodecVersion, metrics utils.ChunkMetrics) error {
+func (p *ChunkProposer) updateDBChunkInfo(chunk *encoding.Chunk, codecVersion encoding.CodecVersion, metrics *utils.ChunkMetrics) error {
 	if chunk == nil {
 		return nil
 	}
 
+	compatibilityBreachOccurred := false
+	codecConfig := utils.CodecConfig{
+		Version:        codecVersion,
+		EnableCompress: true,
+	}
+
+	for {
+		compatible, err := utils.CheckChunkCompressedDataCompatibility(chunk, codecVersion)
+		if err != nil {
+			log.Error("Failed to check chunk compressed data compatibility", "start block number", chunk.Blocks[0].Header.Number, "codecVersion", codecVersion, "err", err)
+			return err
+		}
+
+		if compatible {
+			break
+		}
+
+		compatibilityBreachOccurred = true
+
+		if len(chunk.Blocks) == 1 {
+			log.Warn("Disable compression: cannot truncate chunk with only 1 block for compatibility", "block number", chunk.Blocks[0].Header.Number)
+			codecConfig.EnableCompress = false
+			break
+		}
+
+		chunk.Blocks = chunk.Blocks[:len(chunk.Blocks)-1]
+
+		log.Info("Chunk not compatible with compressed data, removing last block", "start block number", chunk.Blocks[0].Header.Number, "truncated block length", len(chunk.Blocks))
+	}
+
+	if compatibilityBreachOccurred {
+		p.compressedDataCompatibilityBreachTotal.Inc()
+
+		// recalculate chunk metrics after truncation
+		var calcErr error
+		metrics, calcErr = utils.CalculateChunkMetrics(chunk, codecConfig)
+		if calcErr != nil {
+			return fmt.Errorf("failed to calculate chunk metrics, start block number: %v, error: %w", chunk.Blocks[0].Header.Number, calcErr)
+		}
+
+		p.recordTimerChunkMetrics(metrics)
+		p.recordAllChunkMetrics(metrics)
+	}
+
+	if len(chunk.Blocks) > 0 {
+		p.chunkProposeBlockHeight.Set(float64(chunk.Blocks[len(chunk.Blocks)-1].Header.Number.Uint64()))
+	}
+	p.chunkProposeThroughput.Add(float64(chunk.L2GasUsed()))
+
 	p.proposeChunkUpdateInfoTotal.Inc()
 	err := p.db.Transaction(func(dbTX *gorm.DB) error {
-		dbChunk, err := p.chunkOrm.InsertChunk(p.ctx, chunk, codecVersion, metrics, dbTX)
+		dbChunk, err := p.chunkOrm.InsertChunk(p.ctx, chunk, codecConfig, *metrics, dbTX)
 		if err != nil {
-			log.Warn("ChunkProposer.InsertChunk failed", "err", err)
+			log.Warn("ChunkProposer.InsertChunk failed", "codec version", codecVersion, "enable compress", codecConfig.EnableCompress, "err", err)
 			return err
 		}
 		if err := p.l2BlockOrm.UpdateChunkHashInRange(p.ctx, dbChunk.StartBlockNumber, dbChunk.EndBlockNumber, dbChunk.Hash, dbTX); err != nil {
@@ -202,10 +259,6 @@ func (p *ChunkProposer) proposeChunk() error {
 	}
 
 	maxBlocksThisChunk := p.maxBlockNumPerChunk
-	blocksUntilFork := forks.BlocksUntilFork(unchunkedBlockHeight, p.forkHeights)
-	if blocksUntilFork != 0 && blocksUntilFork < maxBlocksThisChunk {
-		maxBlocksThisChunk = blocksUntilFork
-	}
 
 	// select at most maxBlocksThisChunk blocks
 	blocks, err := p.l2BlockOrm.GetL2BlocksGEHeight(p.ctx, unchunkedBlockHeight, int(maxBlocksThisChunk))
@@ -217,43 +270,39 @@ func (p *ChunkProposer) proposeChunk() error {
 		return nil
 	}
 
-	var codecVersion encoding.CodecVersion
-	if !p.chainCfg.IsBernoulli(blocks[0].Header.Number) {
-		codecVersion = encoding.CodecV0
-	} else if !p.chainCfg.IsCurie(blocks[0].Header.Number) {
-		codecVersion = encoding.CodecV1
-	} else {
-		codecVersion = encoding.CodecV2
+	// Ensure all blocks in the same chunk use the same hardfork name
+	// If a different hardfork name is found, truncate the blocks slice at that point
+	hardforkName := forks.GetHardforkName(p.chainCfg, blocks[0].Header.Number.Uint64(), blocks[0].Header.Time)
+	for i := 1; i < len(blocks); i++ {
+		currentHardfork := forks.GetHardforkName(p.chainCfg, blocks[i].Header.Number.Uint64(), blocks[i].Header.Time)
+		if currentHardfork != hardforkName {
+			blocks = blocks[:i]
+			maxBlocksThisChunk = uint64(i) // update maxBlocksThisChunk to trigger chunking, because these blocks are the last blocks before the hardfork
+			break
+		}
+	}
+
+	codecConfig := utils.CodecConfig{
+		Version:        forks.GetCodecVersion(p.chainCfg, blocks[0].Header.Number.Uint64(), blocks[0].Header.Time),
+		EnableCompress: true, // codecv4 is the only version that supports conditional compression, default to enable compression
 	}
 
 	// Including Curie block in a sole chunk.
 	if p.chainCfg.CurieBlock != nil && blocks[0].Header.Number.Cmp(p.chainCfg.CurieBlock) == 0 {
 		chunk := encoding.Chunk{Blocks: blocks[:1]}
-		metrics, calcErr := utils.CalculateChunkMetrics(&chunk, codecVersion)
+		metrics, calcErr := utils.CalculateChunkMetrics(&chunk, codecConfig)
 		if calcErr != nil {
 			return fmt.Errorf("failed to calculate chunk metrics: %w", calcErr)
 		}
 		p.recordTimerChunkMetrics(metrics)
-		return p.updateDBChunkInfo(&chunk, codecVersion, *metrics)
+		return p.updateDBChunkInfo(&chunk, codecConfig.Version, metrics)
 	}
 
 	var chunk encoding.Chunk
 	for i, block := range blocks {
 		chunk.Blocks = append(chunk.Blocks, block)
 
-		metrics, calcErr := utils.CalculateChunkMetrics(&chunk, codecVersion)
-		var compressErr *encoding.CompressedDataCompatibilityError
-		if errors.As(calcErr, &compressErr) {
-			if i == 0 {
-				// The first block fails compressed data compatibility check, manual fix is needed.
-				return fmt.Errorf("the first block fails compressed data compatibility check; block number: %v", block.Header.Number)
-			}
-			log.Warn("breaking limit condition in proposing a new chunk due to a compressed data compatibility breach", "start block number", chunk.Blocks[0].Header.Number, "block count", len(chunk.Blocks))
-			chunk.Blocks = chunk.Blocks[:len(chunk.Blocks)-1]
-			p.compressedDataCompatibilityBreachTotal.Inc()
-			return p.updateDBChunkInfo(&chunk, codecVersion, *metrics)
-		}
-
+		metrics, calcErr := utils.CalculateChunkMetrics(&chunk, codecConfig)
 		if calcErr != nil {
 			return fmt.Errorf("failed to calculate chunk metrics: %w", calcErr)
 		}
@@ -290,17 +339,17 @@ func (p *ChunkProposer) proposeChunk() error {
 
 			chunk.Blocks = chunk.Blocks[:len(chunk.Blocks)-1]
 
-			metrics, calcErr := utils.CalculateChunkMetrics(&chunk, codecVersion)
+			metrics, calcErr := utils.CalculateChunkMetrics(&chunk, codecConfig)
 			if calcErr != nil {
 				return fmt.Errorf("failed to calculate chunk metrics: %w", calcErr)
 			}
 
 			p.recordAllChunkMetrics(metrics)
-			return p.updateDBChunkInfo(&chunk, codecVersion, *metrics)
+			return p.updateDBChunkInfo(&chunk, codecConfig.Version, metrics)
 		}
 	}
 
-	metrics, calcErr := utils.CalculateChunkMetrics(&chunk, codecVersion)
+	metrics, calcErr := utils.CalculateChunkMetrics(&chunk, codecConfig)
 	if calcErr != nil {
 		return fmt.Errorf("failed to calculate chunk metrics: %w", calcErr)
 	}
@@ -308,15 +357,14 @@ func (p *ChunkProposer) proposeChunk() error {
 	currentTimeSec := uint64(time.Now().Unix())
 	if metrics.FirstBlockTimestamp+p.chunkTimeoutSec < currentTimeSec || metrics.NumBlocks == maxBlocksThisChunk {
 		log.Info("reached maximum number of blocks in chunk or first block timeout",
-			"start block number", chunk.Blocks[0].Header.Number,
 			"block count", len(chunk.Blocks),
-			"block number", chunk.Blocks[0].Header.Number,
-			"block timestamp", metrics.FirstBlockTimestamp,
+			"start block number", chunk.Blocks[0].Header.Number,
+			"start block timestamp", metrics.FirstBlockTimestamp,
 			"current time", currentTimeSec)
 
 		p.chunkFirstBlockTimeoutReached.Inc()
 		p.recordAllChunkMetrics(metrics)
-		return p.updateDBChunkInfo(&chunk, codecVersion, *metrics)
+		return p.updateDBChunkInfo(&chunk, codecConfig.Version, metrics)
 	}
 
 	log.Debug("pending blocks do not reach one of the constraints or contain a timeout block")

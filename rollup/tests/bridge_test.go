@@ -105,10 +105,14 @@ func setupEnv(t *testing.T) {
 	l2Cfg.Confirmations = 0
 	l2Cfg.RelayerConfig.SenderConfig.Confirmations = 0
 
-	l1Auth, err = bind.NewKeyedTransactorWithChainID(l2Cfg.RelayerConfig.CommitSenderPrivateKey, l1GethChainID)
+	pKey, err := crypto.ToECDSA(common.FromHex(l2Cfg.RelayerConfig.CommitSenderPrivateKey))
+	assert.NoError(t, err)
+	l1Auth, err = bind.NewKeyedTransactorWithChainID(pKey, l1GethChainID)
 	assert.NoError(t, err)
 
-	l2Auth, err = bind.NewKeyedTransactorWithChainID(l1Cfg.RelayerConfig.GasOracleSenderPrivateKey, l2GethChainID)
+	pKey, err = crypto.ToECDSA(common.FromHex(l2Cfg.RelayerConfig.GasOracleSenderPrivateKey))
+	assert.NoError(t, err)
+	l2Auth, err = bind.NewKeyedTransactorWithChainID(pKey, l2GethChainID)
 	assert.NoError(t, err)
 
 	port, err := rand.Int(rand.Reader, big.NewInt(10000))
@@ -204,13 +208,12 @@ func TestFunction(t *testing.T) {
 
 	// l1 rollup and watch rollup events
 	t.Run("TestCommitAndFinalizeGenesisBatch", testCommitAndFinalizeGenesisBatch)
-	t.Run("TestCommitBatchAndFinalizeBatch", testCommitBatchAndFinalizeBatch)
-	t.Run("TestCommitBatchAndFinalizeBatch4844", testCommitBatchAndFinalizeBatch4844)
-	t.Run("TestCommitBatchAndFinalizeBatchBeforeAndAfter4844", testCommitBatchAndFinalizeBatchBeforeAndAfter4844)
-	t.Run("TestCommitBatchAndFinalizeBatchBeforeAndAfterCompression", testCommitBatchAndFinalizeBatchBeforeAndAfterCompression)
+	t.Run("testCommitBatchAndFinalizeBatchOrBundleWithAllCodecVersions", testCommitBatchAndFinalizeBatchOrBundleWithAllCodecVersions)
+	t.Run("TestCommitBatchAndFinalizeBatchOrBundleCrossingAllTransitions", testCommitBatchAndFinalizeBatchOrBundleCrossingAllTransitions)
 
 	// l1/l2 gas oracle
 	t.Run("TestImportL1GasPrice", testImportL1GasPrice)
 	t.Run("TestImportL1GasPriceAfterCurie", testImportL1GasPriceAfterCurie)
+	t.Run("TestImportDefaultL1GasPriceDueToL1GasPriceSpike", testImportDefaultL1GasPriceDueToL1GasPriceSpike)
 	t.Run("TestImportL2GasPrice", testImportL2GasPrice)
 }

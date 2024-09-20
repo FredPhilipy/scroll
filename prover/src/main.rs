@@ -1,4 +1,5 @@
 #![feature(lazy_cell)]
+#![feature(core_intrinsics)]
 
 mod config;
 mod coordinator_client;
@@ -37,7 +38,7 @@ struct Args {
     log_file: Option<String>,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn start() -> Result<()> {
     let args = Args::parse();
 
     if args.version {
@@ -65,7 +66,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     log::info!(
         "prover start successfully. name: {}, type: {:?}, publickey: {}, version: {}",
         config.prover_name,
-        config.proof_type,
+        config.prover_type,
         prover.get_public_key(),
         version::get_version(),
     );
@@ -75,4 +76,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     task_processor.start();
 
     Ok(())
+}
+
+fn main() {
+    let result = start();
+    if let Err(e) = result {
+        log::error!("main exit with error {:#}", e)
+    }
 }

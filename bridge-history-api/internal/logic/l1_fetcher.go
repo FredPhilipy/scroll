@@ -51,11 +51,8 @@ type L1FetcherLogic struct {
 // NewL1FetcherLogic creates L1 fetcher logic
 func NewL1FetcherLogic(cfg *config.FetcherConfig, db *gorm.DB, client *ethclient.Client) *L1FetcherLogic {
 	addressList := []common.Address{
-		common.HexToAddress(cfg.ETHGatewayAddr),
-
 		common.HexToAddress(cfg.StandardERC20GatewayAddr),
 		common.HexToAddress(cfg.CustomERC20GatewayAddr),
-		common.HexToAddress(cfg.WETHGatewayAddr),
 		common.HexToAddress(cfg.DAIGatewayAddr),
 
 		common.HexToAddress(cfg.ERC721GatewayAddr),
@@ -69,11 +66,8 @@ func NewL1FetcherLogic(cfg *config.FetcherConfig, db *gorm.DB, client *ethclient
 	}
 
 	gatewayList := []common.Address{
-		common.HexToAddress(cfg.ETHGatewayAddr),
-
 		common.HexToAddress(cfg.StandardERC20GatewayAddr),
 		common.HexToAddress(cfg.CustomERC20GatewayAddr),
-		common.HexToAddress(cfg.WETHGatewayAddr),
 		common.HexToAddress(cfg.DAIGatewayAddr),
 
 		common.HexToAddress(cfg.ERC721GatewayAddr),
@@ -103,6 +97,26 @@ func NewL1FetcherLogic(cfg *config.FetcherConfig, db *gorm.DB, client *ethclient
 	if common.HexToAddress(cfg.BatchBridgeGatewayAddr) != (common.Address{}) {
 		addressList = append(addressList, common.HexToAddress(cfg.BatchBridgeGatewayAddr))
 		gatewayList = append(gatewayList, common.HexToAddress(cfg.BatchBridgeGatewayAddr))
+	}
+
+	if common.HexToAddress(cfg.ETHGatewayAddr) != (common.Address{}) {
+		addressList = append(addressList, common.HexToAddress(cfg.ETHGatewayAddr))
+		gatewayList = append(gatewayList, common.HexToAddress(cfg.ETHGatewayAddr))
+	}
+
+	if common.HexToAddress(cfg.WETHGatewayAddr) != (common.Address{}) {
+		addressList = append(addressList, common.HexToAddress(cfg.WETHGatewayAddr))
+		gatewayList = append(gatewayList, common.HexToAddress(cfg.WETHGatewayAddr))
+	}
+
+	if common.HexToAddress(cfg.GasTokenGatewayAddr) != (common.Address{}) {
+		addressList = append(addressList, common.HexToAddress(cfg.GasTokenGatewayAddr))
+		gatewayList = append(gatewayList, common.HexToAddress(cfg.GasTokenGatewayAddr))
+	}
+
+	if common.HexToAddress(cfg.WrappedTokenGatewayAddr) != (common.Address{}) {
+		addressList = append(addressList, common.HexToAddress(cfg.WrappedTokenGatewayAddr))
+		gatewayList = append(gatewayList, common.HexToAddress(cfg.WrappedTokenGatewayAddr))
 	}
 
 	log.Info("L1 Fetcher configured with the following address list", "addresses", addressList, "gateways", gatewayList)
@@ -210,7 +224,7 @@ func (f *L1FetcherLogic) l1FetcherLogs(ctx context.Context, from, to uint64) ([]
 		Topics:    make([][]common.Hash, 1),
 	}
 
-	query.Topics[0] = make([]common.Hash, 14)
+	query.Topics[0] = make([]common.Hash, 16)
 	query.Topics[0][0] = backendabi.L1DepositETHSig
 	query.Topics[0][1] = backendabi.L1DepositERC20Sig
 	query.Topics[0][2] = backendabi.L1DepositERC721Sig
@@ -224,7 +238,9 @@ func (f *L1FetcherLogic) l1FetcherLogs(ctx context.Context, from, to uint64) ([]
 	query.Topics[0][10] = backendabi.L1QueueTransactionEventSig
 	query.Topics[0][11] = backendabi.L1DequeueTransactionEventSig
 	query.Topics[0][12] = backendabi.L1DropTransactionEventSig
-	query.Topics[0][13] = backendabi.L1BridgeBatchDepositSig
+	query.Topics[0][13] = backendabi.L1ResetDequeuedTransactionEventSig
+	query.Topics[0][14] = backendabi.L1BridgeBatchDepositSig
+	query.Topics[0][15] = backendabi.L1DepositWrappedTokenSig
 
 	eventLogs, err := f.client.FilterLogs(ctx, query)
 	if err != nil {
@@ -339,6 +355,10 @@ func (f *L1FetcherLogic) updateMetrics(res L1FilterResult) {
 			f.l1FetcherLogicFetchedTotal.WithLabelValues("L1_skip_message").Add(1)
 		case btypes.MessageQueueEventTypeDropTransaction:
 			f.l1FetcherLogicFetchedTotal.WithLabelValues("L1_drop_message").Add(1)
+		// one ResetDequeuedTransaction event could indicate reset multiple skipped messages,
+		// this metric only counts the number of events, not the number of skipped messages.
+		case btypes.MessageQueueEventTypeResetDequeuedTransaction:
+			f.l1FetcherLogicFetchedTotal.WithLabelValues("L1_reset_skipped_messages").Add(1)
 		}
 	}
 
